@@ -1,13 +1,11 @@
-services:
-  # 1. PostgreSQL Database
-  - type: pg
-    name: vidyaverify-db
-    env: postgres
-    plan: free
+databases:
+  - name: vidyaverify-db
     databaseName: vidyaverify
     user: vidyaverify_user
+    plan: free
 
-  # 2. FastAPI Backend
+services:
+  # FastAPI Backend
   - type: web
     name: vidyaverify-backend
     env: python
