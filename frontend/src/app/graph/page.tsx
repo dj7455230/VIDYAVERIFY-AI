@@ -71,18 +71,26 @@ function GraphView() {
           padding: 4,
         },
       }));
-      const rEdges: Edge[] = data.edges.map((e: any) => ({
-        id: e.id,
-        source: e.source,
-        target: e.target,
-        label: e.label,
-        animated: e.type === "potential_conflict",
-        style: e.type === "potential_conflict"
-          ? { stroke: "#ef4444", strokeDasharray: 4 }
-          : e.type === "approval"
-          ? { stroke: "#6366f1" }
-          : { stroke: "#475569" },
-      }));
+      // Deduplicate edges by ID to avoid React key conflicts
+      const seenEdgeIds = new Set<string>();
+      const rEdges: Edge[] = data.edges
+        .filter((e: any) => {
+          if (seenEdgeIds.has(e.id)) return false;
+          seenEdgeIds.add(e.id);
+          return true;
+        })
+        .map((e: any) => ({
+          id: e.id,
+          source: e.source,
+          target: e.target,
+          label: e.label,
+          animated: e.type === "potential_conflict",
+          style: e.type === "potential_conflict"
+            ? { stroke: "#ef4444", strokeDasharray: 4 }
+            : e.type === "approval"
+            ? { stroke: "#6366f1" }
+            : { stroke: "#475569" },
+        }));
       setNodes(rNodes);
       setEdges(rEdges);
     } catch {

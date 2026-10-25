@@ -34,6 +34,7 @@ async def get_trust_graph(
     nodes = []
     edges = []
     node_set = set()
+    _edge_counter = [0]
     
     def add_node(node_id: str, node_type: str, label: str, data: dict, risk: str = None):
         if node_id not in node_set:
@@ -45,7 +46,8 @@ async def get_trust_graph(
             node_set.add(node_id)
     
     def add_edge(source: str, target: str, label: str, edge_type: str = "default"):
-        edge_id = f"{source}-{target}"
+        _edge_counter[0] += 1
+        edge_id = f"e{_edge_counter[0]}-{source}-{target}"
         edges.append({
             "id": edge_id,
             "source": source,
