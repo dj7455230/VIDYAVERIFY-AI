@@ -1,0 +1,70 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+venv/
+.venv/
+env/
+ENV/
+
+# Environment
+.env
+.env.local
+.env.*.local
+*.env
+!.env.example
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node
+node_modules/
+.next/
+out/
+build/
+.turbo/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Uploads
+uploads/
+*.xlsx
+*.csv
+!frontend/public/sample/*.csv
+!backend/scripts/sample_data/*.csv
+
+# Logs
+*.log
+logs/
+
+# Test
+.coverage
+htmlcov/
+.pytest_cache/
+coverage/
+.jest/
+
+# Docker
+docker-compose.override.yml
+
+# Secrets
+*.pem
+*.key
+secrets/
