@@ -31,7 +31,9 @@ function ReportsView() {
   }, [reportType]);
 
   const download = () => {
-    window.open(`http://127.0.0.1:8000/api/v1/reports/${reportType}?export=csv`, "_blank");
+    const token = typeof window !== "undefined" ? localStorage.getItem("vv_token") : "";
+    const tokenParam = token ? `&token=${encodeURIComponent(token)}` : "";
+    window.open(`http://127.0.0.1:8000/api/v1/reports/${reportType}?export=csv${tokenParam}`, "_blank");
   };
 
   return (
