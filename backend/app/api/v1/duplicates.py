@@ -28,91 +28,191 @@ async def detect_duplicates(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Run layered duplicate detection across student records."""
-    query = db.query(StudentRecord)
+    """Run layered duplicate detection across student records.
+    
+    Uses SQL GROUP BY to find candidate pairs efficiently, avoiding O(n^2) comparison.
+    """
+    from sqlalchemy import func, literal, text
+    
+    base_query = db.query(StudentRecord)
     
     if current_user.has_role("INSTITUTION_ADMIN"):
         inst_ids = get_user_institution_ids(db, current_user)
-        query = query.filter(StudentRecord.institution_id.in_(inst_ids) if inst_ids else False)
-    
-    students = query.all()
+        if inst_ids:
+            base_query = base_query.filter(StudentRecord.institution_id.in_(inst_ids))
+        else:
+            return {"candidates_found": 0, "candidates": [], "threshold": threshold}
     
     # Clear existing unresolved candidates
     db.query(DuplicateCandidate).filter(DuplicateCandidate.reviewer_decision == "unresolved").delete()
+    db.commit()
+    
+    students = base_query.all()
     
     candidates = []
     
-    for i in range(len(students)):
-        for j in range(i + 1, len(students)):
-            s1 = students[i]
-            s2 = students[j]
-            
-            # Layer 1: Exact APAAR match
-            if s1.apaar_reference == s2.apaar_reference:
-                score = 100.0
-                layer = 1
-                explanation = "Exact APAAR reference match"
-                cross_inst = s1.institution_id != s2.institution_id
-                evidence = json.dumps({"field": "apaar_reference", "s1": s1.apaar_reference[:4] + "***", "s2": s2.apaar_reference[:4] + "***"})
-            else:
-                # Layer 2: Name + DOB + course match
-                name_match = _normalize_name(s1.student_name) == _normalize_name(s2.student_name)
-                dob_match = s1.date_of_birth == s2.date_of_birth and s1.date_of_birth is not None
-                course_match = s1.course_id == s2.course_id
-                
-                if name_match and dob_match:
+    # --- Layer 1: Exact APAAR reference duplicates ---
+    # Use SQL GROUP BY to find groups with the same APAAR reference
+    apaar_groups = db.query(
+        StudentRecord.apaar_reference,
+        func.count(StudentRecord.id).label("cnt"),
+    ).filter(
+        StudentRecord.apaar_reference != None,
+        StudentRecord.apaar_reference != "",
+    ).group_by(StudentRecord.apaar_reference).having(func.count(StudentRecord.id) > 1)
+    
+    # Apply scope filter
+    if current_user.has_role("INSTITUTION_ADMIN"):
+        inst_ids = get_user_institution_ids(db, current_user)
+        apaar_groups = apaar_groups.filter(StudentRecord.institution_id.in_(inst_ids))
+    
+    for apaar_ref, cnt in apaar_groups.all():
+        group_students = db.query(StudentRecord).filter(StudentRecord.apaar_reference == apaar_ref).all()
+        for i in range(len(group_students)):
+            for j in range(i + 1, len(group_students)):
+                s1, s2 = group_students[i], group_students[j]
+                if threshold <= 100:
+                    score = 100.0
+                    layer = 1
+                    explanation = "Exact APAAR reference match"
+                    cross_inst = s1.institution_id != s2.institution_id
+                    evidence = json.dumps({"field": "apaar_reference", "s1": s1.apaar_reference[:4] + "***", "s2": s2.apaar_reference[:4] + "***"})
+                    db.add(DuplicateCandidate(
+                        student_record_id_1=s1.id, student_record_id_2=s2.id,
+                        match_layer=layer, match_score=score,
+                        match_explanation=explanation, match_evidence=evidence,
+                        is_cross_institution=cross_inst,
+                    ))
+                    candidates.append({
+                        "student_1": {"id": s1.id, "name": s1.student_name, "institution_id": s1.institution_id},
+                        "student_2": {"id": s2.id, "name": s2.student_name, "institution_id": s2.institution_id},
+                        "match_layer": layer, "match_score": score,
+                        "explanation": explanation, "is_cross_institution": cross_inst,
+                    })
+    
+    # --- Layer 2: Name + DOB match (exact) ---
+    # Find groups with the same normalized name and date_of_birth
+    # Use a simple lower() comparison for the name
+    name_dob_groups = db.query(
+        func.lower(func.trim(StudentRecord.student_name)).label("norm_name"),
+        StudentRecord.date_of_birth,
+    ).filter(
+        StudentRecord.date_of_birth != None,
+        StudentRecord.student_name != None,
+        StudentRecord.student_name != "",
+    ).group_by(
+        func.lower(func.trim(StudentRecord.student_name)),
+        StudentRecord.date_of_birth,
+    ).having(func.count(StudentRecord.id) > 1)
+    
+    if current_user.has_role("INSTITUTION_ADMIN"):
+        inst_ids = get_user_institution_ids(db, current_user)
+        name_dob_groups = name_dob_groups.filter(StudentRecord.institution_id.in_(inst_ids))
+    
+    for norm_name, dob, *_ in name_dob_groups.all():
+        group_students = db.query(StudentRecord).filter(
+            func.lower(func.trim(StudentRecord.student_name)) == norm_name,
+            StudentRecord.date_of_birth == dob,
+        ).all()
+        for i in range(len(group_students)):
+            for j in range(i + 1, len(group_students)):
+                s1, s2 = group_students[i], group_students[j]
+                # Skip if already found in layer 1
+                if any(c["student_1"]["id"] == s1.id and c["student_2"]["id"] == s2.id for c in candidates):
+                    continue
+                if threshold <= 85:
                     score = 85.0
                     layer = 2
+                    course_match = s1.course_id == s2.course_id
                     explanation = "Matching name and date of birth"
                     cross_inst = s1.institution_id != s2.institution_id
                     evidence = json.dumps({
-                        "name_match": True,
-                        "dob_match": dob_match,
+                        "name_match": True, "dob_match": True,
                         "course_match": course_match,
-                        "s1_name": s1.student_name,
-                        "s2_name": s2.student_name,
+                        "s1_name": s1.student_name, "s2_name": s2.student_name,
                     })
-                # Layer 3: Fuzzy name match
-                else:
-                    try:
-                        from rapidfuzz import fuzz
-                        name_ratio = fuzz.ratio(_normalize_name(s1.student_name), _normalize_name(s2.student_name))
-                    except ImportError:
-                        name_ratio = 80 if _normalize_name(s1.student_name)[:10] == _normalize_name(s2.student_name)[:10] else 0
-                    
-                    if name_ratio >= 80 and s1.date_of_birth == s2.date_of_birth and s1.date_of_birth is not None:
-                        score = float(name_ratio)
-                        layer = 3
-                        explanation = f"Fuzzy name match ({name_ratio:.0f}%) with matching DOB"
-                        cross_inst = s1.institution_id != s2.institution_id
-                        evidence = json.dumps({
-                            "name_fuzz_ratio": name_ratio,
-                            "dob_match": True,
-                            "s1_name": s1.student_name,
-                            "s2_name": s2.student_name,
-                        })
-                    else:
-                        continue
+                    db.add(DuplicateCandidate(
+                        student_record_id_1=s1.id, student_record_id_2=s2.id,
+                        match_layer=layer, match_score=score,
+                        match_explanation=explanation, match_evidence=evidence,
+                        is_cross_institution=cross_inst,
+                    ))
+                    candidates.append({
+                        "student_1": {"id": s1.id, "name": s1.student_name, "institution_id": s1.institution_id},
+                        "student_2": {"id": s2.id, "name": s2.student_name, "institution_id": s2.institution_id},
+                        "match_layer": layer, "match_score": score,
+                        "explanation": explanation, "is_cross_institution": cross_inst,
+                    })
+    
+    # --- Layer 3: Fuzzy name match with same DOB ---
+    # Only run on a limited sample of DOB groups to keep response time reasonable
+    if threshold <= 85:
+        try:
+            from rapidfuzz import fuzz
             
-            if score >= threshold:
-                candidate = DuplicateCandidate(
-                    student_record_id_1=s1.id,
-                    student_record_id_2=s2.id,
-                    match_layer=layer,
-                    match_score=score,
-                    match_explanation=explanation,
-                    match_evidence=evidence,
-                    is_cross_institution=cross_inst,
-                )
-                db.add(candidate)
-                candidates.append({
-                    "student_1": {"id": s1.id, "name": s1.student_name, "institution_id": s1.institution_id},
-                    "student_2": {"id": s2.id, "name": s2.student_name, "institution_id": s2.institution_id},
-                    "match_layer": layer,
-                    "match_score": score,
-                    "explanation": explanation,
-                    "is_cross_institution": cross_inst,
-                })
+            # Get DOB groups with more than 1 student, limited to 500 groups
+            dob_groups_query = db.query(
+                StudentRecord.date_of_birth,
+            ).filter(
+                StudentRecord.date_of_birth != None,
+            ).group_by(StudentRecord.date_of_birth).having(func.count(StudentRecord.id) > 1).limit(500)
+            
+            if current_user.has_role("INSTITUTION_ADMIN"):
+                inst_ids = get_user_institution_ids(db, current_user)
+                dob_groups_query = dob_groups_query.filter(StudentRecord.institution_id.in_(inst_ids))
+            
+            existing_pairs = set((c["student_1"]["id"], c["student_2"]["id"]) for c in candidates)
+            
+            for (dob,) in dob_groups_query.all():
+                # Limit students per DOB group to avoid large comparisons
+                dob_students = db.query(StudentRecord).filter(
+                    StudentRecord.date_of_birth == dob
+                ).limit(50).all()
+                for i in range(len(dob_students)):
+                    for j in range(i + 1, len(dob_students)):
+                        s1, s2 = dob_students[i], dob_students[j]
+                        pair_key = (s1.id, s2.id)
+                        if pair_key in existing_pairs:
+                            continue
+                        
+                        norm1 = _normalize_name(s1.student_name)
+                        norm2 = _normalize_name(s2.student_name)
+                        if not norm1 or not norm2 or norm1 == norm2:
+                            continue  # Skip exact matches (already in layer 2)
+                        
+                        name_ratio = fuzz.ratio(norm1, norm2)
+                        if name_ratio >= 80:
+                            score = float(name_ratio)
+                            layer = 3
+                            explanation = f"Fuzzy name match ({name_ratio:.0f}%) with matching DOB"
+                            cross_inst = s1.institution_id != s2.institution_id
+                            evidence = json.dumps({
+                                "name_fuzz_ratio": name_ratio,
+                                "dob_match": True,
+                                "s1_name": s1.student_name,
+                                "s2_name": s2.student_name,
+                            })
+                            db.add(DuplicateCandidate(
+                                student_record_id_1=s1.id, student_record_id_2=s2.id,
+                                match_layer=layer, match_score=score,
+                                match_explanation=explanation, match_evidence=evidence,
+                                is_cross_institution=cross_inst,
+                            ))
+                            candidates.append({
+                                "student_1": {"id": s1.id, "name": s1.student_name, "institution_id": s1.institution_id},
+                                "student_2": {"id": s2.id, "name": s2.student_name, "institution_id": s2.institution_id},
+                                "match_layer": layer, "match_score": score,
+                                "explanation": explanation, "is_cross_institution": cross_inst,
+                            })
+                            existing_pairs.add(pair_key)
+                        if len(candidates) >= 200:
+                            break
+                    if len(candidates) >= 200:
+                        break
+                if len(candidates) >= 200:
+                    break
+        except ImportError:
+            pass  # rapidfuzz not available, skip layer 3
     
     db.add(AuditLog(
         actor_id=current_user.id,
